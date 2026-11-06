@@ -8,6 +8,8 @@ import log from 'electron-log';
 import Integration from '../integration';
 import PlayerStateStore from '../../services/playerstatestore';
 import ProtectedAPIManager from '../../services/protectedapimanager';
+import MemoryStore from '../../services/memorystore';
+import { MemoryStoreSchema } from '~shared/store/schema';
 import { VideoState } from '~shared/playerstatestore/types';
 
 // The call app can drop the mic for a moment (switching devices, a reconnect). Wait this
@@ -47,6 +49,10 @@ export default class CallPause extends Integration {
     child?.kill();
     this.inCall = false;
     this.pausedByUs = false;
+    this.getService(MemoryStore<MemoryStoreSchema>).set(
+      'callInProgress',
+      false,
+    );
   }
 
   private helperPath() {
@@ -117,6 +123,7 @@ export default class CallPause extends Integration {
     }
     if (this.inCall) return;
     this.inCall = true;
+    this.getService(MemoryStore<MemoryStoreSchema>).set('callInProgress', true);
 
     const state = this.getService(PlayerStateStore).getState();
     if (
@@ -138,6 +145,10 @@ export default class CallPause extends Integration {
     this.resumeTimer = setTimeout(() => {
       this.resumeTimer = null;
       this.inCall = false;
+      this.getService(MemoryStore<MemoryStoreSchema>).set(
+        'callInProgress',
+        false,
+      );
       if (!this.pausedByUs) return;
       this.pausedByUs = false;
 

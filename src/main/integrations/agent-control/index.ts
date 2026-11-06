@@ -206,6 +206,20 @@ export default class AgentControl extends Integration {
     const state = this.getService(PlayerStateStore).getState();
     const cmd: string = request.cmd;
 
+    // Never start sound in the middle of someone's call. Pass "force": true to override.
+    const startsSound =
+      ['play', 'next', 'previous', 'captureTest'].includes(cmd) ||
+      (cmd === 'playPause' && state.trackState !== VideoState.Playing);
+    if (
+      startsSound &&
+      !request.force &&
+      this.getService(MemoryStore<MemoryStoreSchema>).get('callInProgress')
+    ) {
+      throw new AgentError(
+        `refusing "${cmd}": a call is in progress (send "force": true to override)`,
+      );
+    }
+
     if ((SIMPLE_COMMANDS as readonly string[]).includes(cmd)) {
       this.remote(cmd);
       return { done: cmd };
@@ -216,7 +230,12 @@ export default class AgentControl extends Integration {
         return HELP;
 
       case 'state':
-        return this.describeState(state);
+        return {
+          ...this.describeState(state),
+          inCall: !!this.getService(MemoryStore<MemoryStoreSchema>).get(
+            'callInProgress',
+          ),
+        };
 
       case 'play': {
         const { videoId, playlistId } = request;
@@ -433,6 +452,18 @@ export default class AgentControl extends Integration {
         log.error('capture: could not start', err);
         this.disarmCapture();
       }
+      return;
+    }
+
+    if (d.id === cap.videoId && state.trackState === VideoState.Paused) {
+      // A pause leaves a gap that would put the melody out of step with the song.
+      // Throw this one away and wait for the next track instead.
+      this.disarmCapture();
+      await this.page('captureCancel', {}).catch(() => {});
+      log.info(
+        `capture: "${d.title}" was paused, discarded; armed for the next track`,
+      );
+      this.armCapture();
       return;
     }
 

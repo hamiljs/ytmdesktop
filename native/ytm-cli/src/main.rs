@@ -35,6 +35,7 @@ ytm - control the YouTube Music desktop app
   ytm lastfm-login                  open the Last.fm approval page
   ytm raw '{\"cmd\":\"help\"}'        send any request as JSON
 
+During a call, commands that start sound are refused; add --force to override.
 Output is JSON. Socket: $YTM_SOCKET or ~/Library/Application Support/YouTube Music Desktop App/agent.sock";
 
 fn esc(s: &str) -> String {
@@ -227,7 +228,9 @@ fn socket_path() -> String {
 }
 
 fn main() {
-    let request = match build_request(std::env::args().skip(1).collect()) {
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    let force = argv.iter().position(|a| a == "--force").map(|i| argv.remove(i)).is_some();
+    let request = match build_request(argv).map(|r| if force && r.ends_with('}') { format!("{},\"force\":true}}", &r[..r.len() - 1]) } else { r }) {
         Ok(r) => r,
         Err(msg) => {
             eprintln!("{msg}");

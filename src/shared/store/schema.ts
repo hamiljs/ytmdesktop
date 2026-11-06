@@ -111,4 +111,6 @@ export type MemoryStoreSchema = {
   lastFMToken: string;
   // HDC fork: shared with the agent socket for read-only Last.fm queries
   lastFMUsername: string | null;
+  // HDC fork: set by call auto-pause; agent commands that start sound refuse while true
+  callInProgress: boolean;
 };

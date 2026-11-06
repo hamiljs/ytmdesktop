@@ -29,6 +29,9 @@ ytm - control the YouTube Music desktop app
   ytm playlist create TITLE [VIDEO_ID ...] [--desc TEXT] [--unlisted|--public]
                                     new playlist (private by default); no ids = current queue
   ytm playlist add PLAYLIST_ID VIDEO_ID ...
+  ytm capture-test [SECONDS]        record a few seconds now; silent = copy-protected
+  ytm capture-next | capture-status | capture-cancel
+                                    record the next song start to end (for sing-along)
   ytm lastfm-login                  open the Last.fm approval page
   ytm raw '{\"cmd\":\"help\"}'        send any request as JSON
 
@@ -162,6 +165,14 @@ fn build_request(argv: Vec<String>) -> Result<String, String> {
         }
         "lastfm-login" => simple("lastfmLogin"),
         "playlists" => simple("playlists"),
+        "media-info" => simple("mediaInfo"),
+        "capture-test" => {
+            let s = args.words.first().cloned().unwrap_or_else(|| "5".into());
+            Ok(format!("{{\"cmd\":\"captureTest\",\"seconds\":{}}}", value(&s)))
+        }
+        "capture-next" => simple("captureNext"),
+        "capture-status" => simple("captureStatus"),
+        "capture-cancel" => simple("captureCancel"),
         "playlist" => {
             if args.words.is_empty() {
                 return Err("playlist needs: create TITLE [IDS...] | add PLAYLIST_ID IDS...".into());

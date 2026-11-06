@@ -97,6 +97,13 @@ const HELP = {
     addToPlaylist:
       '{playlistId, videoIds} add songs to a playlist (skips ones already in it)',
     playlists: "your library's playlists with their ids",
+    mediaInfo: 'is the player video copy-protected, can it be captured',
+    captureTest:
+      '{seconds?: 1-30} record a few seconds now; reports loudness (silent = copy-protected)',
+    captureNext:
+      'record the next track start to end into <userData>/captures/<videoId>.webm + .json',
+    captureStatus: 'idle, armed or recording; last saved capture',
+    captureCancel: 'stop and discard a capture',
     lastfmLogin:
       "open Last.fm's approval page; the login finishes by itself after you allow it",
     lastfm: `{method, params?} read-only Last.fm call; methods: ${[...LASTFM_READ_METHODS].join(', ')}`,
@@ -111,6 +118,21 @@ export default class AgentControl extends Integration {
     'integrations.agentControlEnabled';
 
   private server: net.Server | null = null;
+
+  // Sing-along capture: armed -> recording (from the first second of the next track) -> saved
+  private capture: {
+    videoId: string | null;
+    recording: boolean;
+    meta: {
+      videoId: string;
+      title: string;
+      artist: string;
+      album: string | null;
+      durationSeconds: number;
+    } | null;
+    listener: (state: PlayerState) => void;
+  } | null = null;
+  private lastCapture: string | null = null;
 
   public onSetup() {}
 
@@ -288,6 +310,51 @@ export default class AgentControl extends Integration {
       case 'playlists':
         return this.page('playlists', {});
 
+      case 'mediaInfo':
+        return this.page('mediaInfo', {});
+
+      case 'captureTest': {
+        // Record a few seconds now and report how loud it was: silence = copy-protected
+        if (this.capture)
+          throw new AgentError('a capture is already armed or running');
+        const seconds = Math.max(1, Math.min(30, Number(request.seconds) || 5));
+        const start: any = await this.page('captureStart', {});
+        await new Promise((resolve) => setTimeout(resolve, seconds * 1000));
+        const result: any = await this.page('captureStop', {});
+        return {
+          encrypted: start.encrypted,
+          seconds: result.seconds,
+          bytes: result.bytes.length,
+          peak: result.peak,
+          silent: result.peak < 0.001,
+        };
+      }
+
+      case 'captureNext': {
+        if (this.capture)
+          throw new AgentError('a capture is already armed or running');
+        this.armCapture();
+        return {
+          armed: true,
+          note: 'records the next track from its start; check with captureStatus',
+        };
+      }
+
+      case 'captureStatus':
+        return this.capture
+          ? {
+              state: this.capture.recording ? 'recording' : 'armed',
+              videoId: this.capture.videoId,
+              title: this.capture.meta?.title ?? null,
+              lastSaved: this.lastCapture,
+            }
+          : { state: 'idle', lastSaved: this.lastCapture };
+
+      case 'captureCancel':
+        this.disarmCapture();
+        await this.page('captureCancel', {}).catch(() => {});
+        return { cancelled: true };
+
       case 'lastfm':
         return this.lastfm(request.method, request.params ?? {});
 
@@ -310,6 +377,101 @@ export default class AgentControl extends Integration {
         throw new AgentError(
           `unknown command "${cmd}"; {"cmd":"help"} lists them`,
         );
+    }
+  }
+
+  private armCapture() {
+    const store = this.getService(PlayerStateStore);
+    const startVideoId = store.getState().videoDetails?.id ?? null;
+    const listener = (state: PlayerState) => void this.onCaptureState(state);
+    this.capture = {
+      videoId: startVideoId,
+      recording: false,
+      meta: null,
+      listener,
+    };
+    store.on('state-changed', listener);
+    log.info('capture: armed for the next track');
+  }
+
+  private disarmCapture() {
+    if (!this.capture) return;
+    this.getService(PlayerStateStore).off(
+      'state-changed',
+      this.capture.listener,
+    );
+    this.capture = null;
+  }
+
+  private async onCaptureState(state: PlayerState) {
+    const cap = this.capture;
+    const d = state.videoDetails;
+    if (!cap || !d) return;
+
+    if (!cap.recording) {
+      // Start on a new track, within its first 2 seconds, once it is actually playing
+      if (
+        d.id === cap.videoId ||
+        state.trackState !== VideoState.Playing ||
+        state.videoProgress > 2 ||
+        state.adPlaying
+      )
+        return;
+      cap.recording = true;
+      cap.videoId = d.id;
+      cap.meta = {
+        videoId: d.id,
+        title: d.title,
+        artist: d.author,
+        album: d.album,
+        durationSeconds: d.durationSeconds,
+      };
+      try {
+        await this.page('captureStart', {});
+        log.info(`capture: recording "${d.author} - ${d.title}"`);
+      } catch (err) {
+        log.error('capture: could not start', err);
+        this.disarmCapture();
+      }
+      return;
+    }
+
+    if (d.id !== cap.videoId) {
+      // Track changed: stop and save. Only keep it if most of the song was recorded.
+      const meta = cap.meta!;
+      this.disarmCapture();
+      try {
+        const result: any = await this.page('captureStop', {});
+        if (result.seconds < meta.durationSeconds * 0.9) {
+          log.warn(
+            `capture: only ${result.seconds}s of ${meta.durationSeconds}s recorded (skipped or paused?), discarded`,
+          );
+          return;
+        }
+        const dir = path.join(app.getPath('userData'), 'captures');
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+        const base = path.join(dir, meta.videoId);
+        fs.writeFileSync(`${base}.webm`, Buffer.from(result.bytes));
+        fs.writeFileSync(
+          `${base}.json`,
+          JSON.stringify(
+            {
+              ...meta,
+              recordedSeconds: result.seconds,
+              peak: result.peak,
+              capturedAt: new Date().toISOString(),
+            },
+            null,
+            2,
+          ),
+        );
+        this.lastCapture = `${base}.webm`;
+        log.info(
+          `capture: saved ${base}.webm (${result.seconds}s, peak ${result.peak})`,
+        );
+      } catch (err) {
+        log.error('capture: could not save', err);
+      }
     }
   }
 

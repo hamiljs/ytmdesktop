@@ -293,6 +293,99 @@ async function listPlaylists() {
     .filter(Boolean);
 }
 
+// ---- Audio capture (sing-along) ------------------------------------------------------
+// Records the page's own <video> element output with captureStream(), which does not
+// mute what you hear. If YouTube Music plays copy-protected (EME) media, the stream is
+// silent, so every capture reports its loudness.
+
+let recorder: MediaRecorder | null = null;
+let chunks: Blob[] = [];
+let meterPeak = 0;
+let meterContext: AudioContext | null = null;
+let meterTimer: number | null = null;
+let startedAt = 0;
+
+function playerVideo(): HTMLVideoElement {
+  const video = document.querySelector('video');
+  if (!video) throw new Error('no player video element yet');
+  return video;
+}
+
+function mediaInfo() {
+  const video = document.querySelector('video');
+  return {
+    hasVideo: !!video,
+    encrypted: !!(video as any)?.mediaKeys,
+    canCapture: typeof (video as any)?.captureStream === 'function',
+    paused: video?.paused ?? null,
+    currentTime: video?.currentTime ?? null,
+  };
+}
+
+function captureStart() {
+  if (recorder) throw new Error('already recording');
+  const video = playerVideo() as any;
+  const audio = video.captureStream().getAudioTracks();
+  if (audio.length === 0)
+    throw new Error('the player has no audio track to capture');
+  const stream = new MediaStream(audio);
+
+  meterPeak = 0;
+  meterContext = new AudioContext();
+  const analyser = meterContext.createAnalyser();
+  analyser.fftSize = 2048;
+  meterContext.createMediaStreamSource(stream).connect(analyser); // meter only, not to speakers
+  const buf = new Float32Array(analyser.fftSize);
+  meterTimer = window.setInterval(() => {
+    analyser.getFloatTimeDomainData(buf);
+    for (const v of buf) meterPeak = Math.max(meterPeak, Math.abs(v));
+  }, 200);
+
+  chunks = [];
+  recorder = new MediaRecorder(stream, {
+    mimeType: 'audio/webm;codecs=opus',
+    audioBitsPerSecond: 192000,
+  });
+  recorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+  recorder.start(1000);
+  startedAt = performance.now();
+  return { started: true, encrypted: !!video.mediaKeys };
+}
+
+async function captureStop() {
+  const active = recorder;
+  if (!active) throw new Error('not recording');
+  recorder = null;
+  await new Promise<void>((resolve) => {
+    active.onstop = () => resolve();
+    active.stop();
+  });
+  if (meterTimer) clearInterval(meterTimer);
+  await meterContext?.close();
+  meterContext = null;
+  const blob = new Blob(chunks, { type: 'audio/webm' });
+  chunks = [];
+  return {
+    bytes: new Uint8Array(await blob.arrayBuffer()),
+    seconds: Math.round((performance.now() - startedAt) / 100) / 10,
+    peak: Math.round(meterPeak * 1000) / 1000,
+  };
+}
+
+function captureCancel() {
+  try {
+    recorder?.stop();
+  } catch {
+    // already stopped
+  }
+  recorder = null;
+  chunks = [];
+  if (meterTimer) clearInterval(meterTimer);
+  void meterContext?.close();
+  meterContext = null;
+  return { cancelled: true };
+}
+
 export default function init() {
   const agentApi = protectedapimanager.createOrGetAPI('Agent');
 
@@ -335,4 +428,8 @@ export default function init() {
     addToPlaylist(String(a.playlistId ?? ''), videoIdList(a.videoIds)),
   );
   handle('playlists', () => listPlaylists());
+  handle('mediaInfo', async () => mediaInfo());
+  handle('captureStart', async () => captureStart());
+  handle('captureStop', () => captureStop());
+  handle('captureCancel', async () => captureCancel());
 }

@@ -37,6 +37,10 @@ export type StoreSchema = {
     discordPresenceEnabled: boolean;
     lastFMEnabled: boolean;
     enhancedMediaServiceEnabled: boolean;
+    // HDC fork
+    callAutoPauseEnabled: boolean;
+    nightlyRestartEnabled: boolean;
+    agentControlEnabled: boolean;
   };
   shortcuts: {
     playPause: string;
@@ -61,6 +65,9 @@ export type StoreSchema = {
   lastfm: {
     sessionKey: string | null;
     scrobblePercent: number;
+    // HDC fork
+    loveSync: boolean;
+    cleanNames: boolean;
   };
   developer: {
     enableDevTools: boolean;
@@ -102,4 +109,6 @@ export type MemoryStoreSchema = {
 
   lastFMAuthenticationStep: number;
   lastFMToken: string;
+  // HDC fork: shared with the agent socket for read-only Last.fm queries
+  lastFMUsername: string | null;
 };

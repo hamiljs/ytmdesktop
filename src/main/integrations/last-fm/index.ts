@@ -1,4 +1,5 @@
-import { shell, safeStorage, ipcMain } from "electron";
+import { app, shell, safeStorage, ipcMain } from "electron";
+import path from "node:path";
 
 import PlayerStateStore from "../../services/playerstatestore";
 import MemoryStore from "../../services/memorystore";
@@ -7,8 +8,10 @@ import ConfigStore from "../../services/configstore";
 import log from "electron-log";
 import Integration from "../integration";
 import { MemoryStoreSchema, StoreSchema } from "~shared/store/schema";
-import { PlayerSignal, PlayerState, VideoState } from "~shared/playerstatestore/types";
+import { LikeStatus, PlayerSignal, PlayerState, VideoState } from "~shared/playerstatestore/types";
 import LastFMClient from "./last-fm-client";
+import LastFMOutbox from "./outbox";
+import { CleanTrack, chosenByUser, cleanTrack } from "./track-name.mjs";
 
 declare const LASTFM_API_KEY: string | null | undefined;
 declare const LASTFM_API_SECRET: string | null | undefined;
@@ -23,6 +26,16 @@ export default class LastFM extends Integration {
   private playerSignalFunction: ((signal: PlayerSignal) => void) | null = null;
 
   private lastFMClient?: LastFMClient;
+  private outbox?: LastFMOutbox;
+
+  // The cleaned name of the current video. Set once per video before now playing is sent.
+  private currentTrack: Promise<CleanTrack> | null = null;
+  private currentChosenByUser = true;
+  // Like status last seen for the current video, to spot thumbs up and thumbs down
+  private lastLikeStatus: LikeStatus = LikeStatus.Unknown;
+  // Videos already loved this session, so replaying a liked song sends one love, not one per play
+  private lovedThisSession = new Set<string>();
+  private correctionCache = new Map<string, CleanTrack>();
 
   private currentVideoId: string | null = null
   private scrobbleTimeRequired = -1;
@@ -50,12 +63,23 @@ export default class LastFM extends Integration {
     }
 
     this.lastFMDetails = await this.getSettings();
-    this.lastFMClient = new LastFMClient(LASTFM_API_KEY, LASTFM_API_SECRET, this.lastFMDetails.sessionKey ?? undefined);
+    // A login made with another API key (upstream's build) or revoked on last.fm stops
+    // working. Forget it and show the "Log in to Last.fm" button again. Unsent scrobbles
+    // stay in the outbox until the new login.
+    this.lastFMClient = new LastFMClient(LASTFM_API_KEY, LASTFM_API_SECRET, this.lastFMDetails.sessionKey ?? undefined, () => {
+      log.warn("lastfm: session no longer valid, log in again from Settings > Integrations");
+      if (this.lastFMDetails) this.lastFMDetails.sessionKey = null;
+      this.getService(ConfigStore).set("lastfm.sessionKey", null);
+      memoryStore.set("lastFMAuthenticationStep", 0);
+    });
+    if (!this.outbox) this.outbox = new LastFMOutbox(path.join(app.getPath("userData"), "lastfm-outbox.json"), () => this.lastFMClient);
+    this.outbox.start();
 
     if (!this.lastFMDetails.sessionKey) {
       memoryStore.set("lastFMAuthenticationStep", 0);
     } else {
       memoryStore.set("lastFMAuthenticationStep", 2);
+      void this.refreshUserName();
     }
 
     this.playerStateFunction = (state: PlayerState) => this.updatePlayerState(state);
@@ -64,6 +88,18 @@ export default class LastFM extends Integration {
     const playerStateStore = this.getService(PlayerStateStore);
     playerStateStore.on("state-changed", this.playerStateFunction);
     playerStateStore.on("player-signal", this.playerSignalFunction);
+
+    const finishLogin = async (token: string): Promise<boolean> => {
+      if (!this.lastFMClient || memoryStore.get("lastFMToken") !== token) return false;
+      const sessionKey = await this.lastFMClient.getSession(token);
+      if (this.lastFMDetails) this.lastFMDetails.sessionKey = sessionKey;
+      await this.saveSettings();
+      memoryStore.set("lastFMAuthenticationStep", 2);
+      log.info("lastfm: logged in");
+      void this.refreshUserName();
+      void this.outbox?.flush();
+      return true;
+    };
 
     ipcMain.on("lastfm:authenticate", async () => {
       const authStep = memoryStore.get("lastFMAuthenticationStep");
@@ -75,13 +111,24 @@ export default class LastFM extends Integration {
         shell.openExternal(
           `https://www.last.fm/api/auth/` + `?api_key=${encodeURIComponent(LASTFM_API_KEY)}` + `&token=${encodeURIComponent(token)}`
         );
-      } else if (authStep === 1) {
-        if (!this.lastFMClient) return;
 
-        const sessionKey = await this.lastFMClient.getSession(memoryStore.get("lastFMToken") as string);
-        if (this.lastFMDetails) this.lastFMDetails.sessionKey = sessionKey;
-        this.saveSettings();
-        memoryStore.set("lastFMAuthenticationStep", 2);
+        // Finish by itself once the user approves in the browser, so the "Finish" click is
+        // optional. Last.fm answers "unauthorized token" until then; tokens live 60 minutes.
+        const deadline = Date.now() + 10 * 60 * 1000;
+        while (Date.now() < deadline && memoryStore.get("lastFMAuthenticationStep") === 1 && memoryStore.get("lastFMToken") === token) {
+          await new Promise(resolve => setTimeout(resolve, 3000));
+          try {
+            if (memoryStore.get("lastFMAuthenticationStep") === 1 && (await finishLogin(token))) return;
+          } catch {
+            // not approved yet
+          }
+        }
+      } else if (authStep === 1) {
+        try {
+          await finishLogin(memoryStore.get("lastFMToken") as string);
+        } catch (err) {
+          log.warn("lastfm: finish login failed, approve the app in the browser first", err);
+        }
       }
     });
   }
@@ -90,6 +137,16 @@ export default class LastFM extends Integration {
     const playerStateStore = this.getService(PlayerStateStore);
     if (this.playerStateFunction) playerStateStore.off("state-changed", this.playerStateFunction);
     if (this.playerSignalFunction) playerStateStore.off("player-signal", this.playerSignalFunction);
+    this.outbox?.stop();
+  }
+
+  private async refreshUserName() {
+    try {
+      const name = await this.lastFMClient?.getUserName();
+      this.getService(MemoryStore<MemoryStoreSchema>).set("lastFMUsername", name ?? null);
+    } catch (err) {
+      log.warn("lastfm: could not read the username", err);
+    }
   }
 
   private async getSettings(): Promise<StoreSchema["lastfm"]> {
@@ -102,15 +159,6 @@ export default class LastFM extends Integration {
         decryptedValues.sessionKey = (await safeStorage.decryptStringAsync(Buffer.from(decryptedValues.sessionKey, "hex"))).result;
       } catch (e) {
         decryptedValues.sessionKey = null;
-        log.error(e);
-      }
-    }
-
-    if (decryptedValues.token) {
-      try {
-        decryptedValues.token = (await safeStorage.decryptStringAsync(Buffer.from(decryptedValues.token, "hex"))).result;
-      } catch (e) {
-        decryptedValues.token = null;
         log.error(e);
       }
     }
@@ -163,6 +211,67 @@ export default class LastFM extends Integration {
     this.accumulatedPlaybackTime = -1;
     this.hasScrobbled = false;
     this.playbackStartTimestamp = new Date().getTime();
+    this.lastLikeStatus = LikeStatus.Unknown;
+    this.currentChosenByUser = chosenByUser(state.playlistId, state.videoDetails.id);
+    this.currentTrack = this.resolveTrack(state);
+  }
+
+  /**
+   * The artist and track name to send to Last.fm. Music videos and uploads get their
+   * names cleaned ("DaftPunkVEVO" -> "Daft Punk"), then checked against Last.fm's own
+   * spelling. Official audio tracks are sent as YouTube Music reports them.
+   */
+  private async resolveTrack(state: PlayerState): Promise<CleanTrack> {
+    const details = state.videoDetails!;
+    const raw = { title: details.title, author: details.author, album: details.album, videoType: details.videoType };
+    const configStore = this.getService(ConfigStore);
+    if (!configStore.get("lastfm.cleanNames")) {
+      return { artist: details.author, track: details.title, album: details.album ?? undefined };
+    }
+
+    const cleaned = cleanTrack(raw);
+    if (details.videoType === 0) return cleaned;
+
+    const cached = this.correctionCache.get(details.id);
+    if (cached) return cached;
+    let result = cleaned;
+    try {
+      const corrected = await this.lastFMClient?.getCorrection(cleaned.artist, cleaned.track);
+      if (corrected) result = { ...cleaned, ...corrected };
+    } catch (err) {
+      log.warn("lastfm: name correction failed, using the cleaned name", err);
+    }
+    if (result.artist !== details.author || result.track !== details.title) {
+      log.info(`lastfm: "${details.author} - ${details.title}" -> "${result.artist} - ${result.track}"`);
+    }
+    if (this.correctionCache.size > 500) this.correctionCache.clear();
+    this.correctionCache.set(details.id, result);
+    return result;
+  }
+
+  /**
+   * Thumbs up in YouTube Music loves the track on Last.fm. Removing the thumbs up, or
+   * a thumbs down, unloves it. A song that is already liked when it starts playing is
+   * loved once per session, which back-fills likes made before this feature existed.
+   */
+  private async syncLove(state: PlayerState) {
+    const details = state.videoDetails;
+    if (!details || details.id !== this.currentVideoId || !this.currentTrack) return;
+    if (!this.getService(ConfigStore).get("lastfm.loveSync")) return;
+
+    const status = details.likeStatus;
+    if (status === LikeStatus.Unknown || status === this.lastLikeStatus) return;
+    const previous = this.lastLikeStatus;
+    this.lastLikeStatus = status;
+
+    const track = await this.currentTrack;
+    if (status === LikeStatus.Like && !this.lovedThisSession.has(details.id)) {
+      this.lovedThisSession.add(details.id);
+      this.outbox?.add({ kind: "love", artist: track.artist, track: track.track });
+    } else if (previous === LikeStatus.Like && status !== LikeStatus.Like) {
+      this.lovedThisSession.delete(details.id);
+      this.outbox?.add({ kind: "unlove", artist: track.artist, track: track.track });
+    }
   }
 
   private async updatePlayerState(state: PlayerState): Promise<void> {
@@ -170,17 +279,20 @@ export default class LastFM extends Integration {
       return;
     }
 
-    this.maybeUpdateScrobble(state);
+    await this.maybeUpdateScrobble(state);
+    void this.syncLove(state);
 
     // Media is actively playing accumulate playback time for scrobble & update now playing if needed
     if (state.videoDetails && state.trackState === VideoState.Playing) {
       if (this.accumulatedPlaybackTime === -1) {
         this.accumulatedPlaybackTime = 0;
         try {
+          const track = await this.currentTrack;
+          if (!track) return;
           await this.lastFMClient?.updateNowPlaying({
-            artist: state.videoDetails.author,
-            track: state.videoDetails.title,
-            album: state.videoDetails.album ?? undefined,
+            artist: track.artist,
+            track: track.track,
+            album: track.album,
             duration: state.videoDetails.durationSeconds
           });
         } catch(err) {
@@ -197,17 +309,20 @@ export default class LastFM extends Integration {
 
         if (this.accumulatedPlaybackTime >= this.scrobbleTimeRequired) {
           this.hasScrobbled = true;
-          try {
-            await this.lastFMClient?.scrobble({
-              artist: state.videoDetails.author,
-              track: state.videoDetails.title,
+          const track = await this.currentTrack;
+          if (!track) return;
+          // Saved to disk first; the outbox sends it now, or later if Last.fm is unreachable
+          this.outbox?.add({
+            kind: "scrobble",
+            play: {
+              artist: track.artist,
+              track: track.track,
               timestamp: Math.floor(this.playbackStartTimestamp / 1000),
-              album: state.videoDetails.album ?? undefined,
-              duration: state.videoDetails.durationSeconds
-            });
-          } catch(err) {
-            log.error("lastfm: failed to scrobble", err);
-          }
+              album: track.album,
+              duration: state.videoDetails.durationSeconds,
+              chosenByUser: this.currentChosenByUser
+            }
+          });
         }
       }
     }

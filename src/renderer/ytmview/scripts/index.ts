@@ -5,6 +5,7 @@ import protectedapimanager from "./protectedapimanager";
 import { createMaterialSymbolsLink, createStyleSheet } from "./setup/styles";
 import { createNavigationMenuArrows } from "./setup/navigation";
 import initRemote from "./setup/remote";
+import initAgent from "./setup/agent";
 import { addTimedLyrics, createAdditionalPlayerBarControls, hideChromecastButton, overrideHistoryButtonDisplay } from "./setup/extras";
 
 protectedapimanager.init();
@@ -59,6 +60,7 @@ window.addEventListener("load", async () => {
 
     {
       initRemote();
+      initAgent();
 
       setupCompletions |= YTMViewSetupCompletionFlags.Remote;
     }

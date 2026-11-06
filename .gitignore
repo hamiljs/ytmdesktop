@@ -145,3 +145,8 @@ vite.config.ts.timestamp-*
 
 # Electron-Forge
 out/
+
+# HDC fork
+native/callwatch/target
+native/ytm-cli/target
+.hdc-secrets.env

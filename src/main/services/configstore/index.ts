@@ -54,7 +54,10 @@ export default class ConfigStore extends Service {
           companionServerCORSWildcardEnabled: true,
           discordPresenceEnabled: false,
           lastFMEnabled: false,
-          enhancedMediaServiceEnabled: true
+          enhancedMediaServiceEnabled: true,
+          callAutoPauseEnabled: true,
+          nightlyRestartEnabled: true,
+          agentControlEnabled: true
         },
         shortcuts: {
           playPause: "",
@@ -78,7 +81,9 @@ export default class ConfigStore extends Service {
         },
         lastfm: {
           sessionKey: null,
-          scrobblePercent: 50
+          scrobblePercent: 50,
+          loveSync: true,
+          cleanNames: true
         },
         developer: {
           enableDevTools: false
@@ -152,6 +157,21 @@ export default class ConfigStore extends Service {
         }
       }
     });
+
+    // HDC fork settings. Conf fills in defaults one top-level section at a time, so an
+    // existing config file never gets new keys inside a section. Add any that are missing.
+    // Done here rather than in a migration so it works whatever version number we ship.
+    const forkDefaults = {
+      "integrations.callAutoPauseEnabled": true,
+      "integrations.nightlyRestartEnabled": true,
+      "integrations.agentControlEnabled": true,
+      "lastfm.loveSync": true,
+      "lastfm.cleanNames": true
+    } as const;
+    for (const [key, value] of Object.entries(forkDefaults)) {
+      // @ts-expect-error Conf types cannot take a key from Object.entries
+      if (!this.conf.has(key)) this.conf.set(key, value);
+    }
 
     if (this.conf.get("general.disableHardwareAcceleration")) {
       app.disableHardwareAcceleration();

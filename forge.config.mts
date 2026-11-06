@@ -25,6 +25,9 @@ const config: ForgeConfig = {
       "src/assets/icons/controls/play-button.png",
       "src/assets/icons/controls/play-next-button.png",
       "src/assets/icons/controls/play-previous-button.png",
+
+      // HDC fork: call auto-pause helper (Rust, macOS only). Build it first: scripts/hdc-install.sh
+      ...(process.platform === "darwin" ? ["native/callwatch/target/release/callwatch"] : []),
     ],
     protocols: [
       {
